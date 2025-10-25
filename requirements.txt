@@ -1,4 +1,3 @@
-# requirements.txt
 streamlit>=1.33
 pillow>=10.0.0
 numpy>=1.23
@@ -6,7 +5,6 @@ opencv-python-headless>=4.9.0.80
 pytesseract>=0.3.10
 easyocr==1.7.1
 torch>=2.1.0; platform_system != "Darwin" or platform_machine != "arm64"
-# For macOS Apple Silicon, you may prefer installing torch via conda or pip wheel instructions.
 dateparser>=1.2.0
 pandas>=2.2.0
 gspread>=6.1.2
