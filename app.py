@@ -1,6 +1,5 @@
-# app.py (regex & tesseract path FIXED)
-# Streamlit OCR (Thai+English) for Quotation/Bill -> Extract Key Fields + Google Sheets Export
 
+# app.py (boosted extraction accuracy)
 import os, re, json, shutil
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
@@ -36,16 +35,25 @@ TH_MONTHS = {
 def to_english_digits(s: str) -> str:
     return s.translate(THAI_DIGITS) if isinstance(s, str) else s
 
+def fix_numberlike_ocr(s: str) -> str:
+    if not isinstance(s, str): return s
+    s = re.sub(r'(?<=\d)[oO](?=[\d,\.])', '0', s)
+    s = re.sub(r'(?<=[,\.\s])[oO](?=\d)', '0', s)
+    s = re.sub(r'(?<=\d)[lI](?=[\d,\.])', '1', s)
+    s = re.sub(r'(?<=\d)B(?=[\d,\.])', '8', s)
+    return s
+
 def normalize_number(s: str) -> Optional[float]:
-    if not s:
-        return None
-    s = to_english_digits(s).replace(" ", "").replace(",", "").replace("฿", "").replace("บาท", "")
+    if not s: return None
+    s = to_english_digits(s)
+    s = fix_numberlike_ocr(s)
+    s = s.replace(" ", "").replace(",", "").replace("฿", "").replace("บาท", "").replace("฿.", "")
+    s = s.replace("%","")
     m = re.findall(r"-?\d+(?:\.\d+)?", s)
     return float(m[0]) if m else None
 
 def sanitize_text(text: str) -> str:
-    if not text:
-        return ""
+    if not text: return ""
     text = to_english_digits(text)
     for short, full in TH_MONTHS.items():
         text = re.sub(short, full, text)
@@ -63,20 +71,17 @@ def parse_date_candidates(text: str) -> Optional[str]:
     th_month_regex = r"(มกราคม|กุมภาพันธ์|มีนาคม|เมษายน|พฤษภาคม|มิถุนายน|กรกฎาคม|สิงหาคม|กันยายน|ตุลาคม|พฤศจิกายน|ธันวาคม)"
     candidates.update(re.findall(rf"\b\d{{1,2}}\s*{th_month_regex}\s*\d{{2,4}}\b", text))
     parsed = []
-    for c in list(candidates)[:15]:
+    for c in list(candidates)[:20]:
         dt = dateparser.parse(c, languages=["th","en"], settings={"PREFER_DATES_FROM":"past","DATE_ORDER":"DMY"})
         if dt:
-            y = dt.year
-            if y > 2400:  # พ.ศ.
-                dt = dt.replace(year=y-543)
+            if dt.year > 2400: dt = dt.replace(year=dt.year-543)
             parsed.append(dt.date())
     if not parsed: return None
     return sorted(parsed, key=lambda x: x.toordinal())[-1].isoformat()
 
 def deskew(binary_img: np.ndarray) -> Tuple[np.ndarray, float]:
     coords = np.column_stack(np.where(binary_img > 0))
-    if coords.size == 0:
-        return binary_img, 0.0
+    if coords.size == 0: return binary_img, 0.0
     angle = cv2.minAreaRect(coords)[-1]
     angle = -(90 + angle) if angle < -45 else -angle
     (h, w) = binary_img.shape[:2]
@@ -102,13 +107,11 @@ def preprocess(img_bgr: np.ndarray) -> Dict[str, np.ndarray]:
     out["morph_open"] = opened
     return out
 
-# ---------- OCR ----------
 def ensure_tesseract(user_path: Optional[str]) -> Tuple[bool, Optional[str], Optional[str]]:
     if pytesseract is None:
         return (False, None, "pytesseract not installed")
     candidates = []
-    if user_path:
-        candidates.append(user_path)
+    if user_path: candidates.append(user_path)
     candidates += [
         "/usr/bin/tesseract","/usr/local/bin/tesseract","/opt/homebrew/bin/tesseract",
         r"C:\Program Files\Tesseract-OCR\tesseract.exe", r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"
@@ -132,8 +135,7 @@ def ensure_tesseract(user_path: Optional[str]) -> Tuple[bool, Optional[str], Opt
     return False, None, "tesseract not found"
 
 def ocr_easyocr(img_rgb: np.ndarray) -> str:
-    if not EASYOCR_AVAILABLE:
-        return ""
+    if not EASYOCR_AVAILABLE: return ""
     reader = easyocr.Reader(["th", "en"], gpu=False)
     res = reader.readtext(img_rgb, detail=0, paragraph=True)
     return "\n".join(res)
@@ -142,27 +144,47 @@ def ocr_tesseract(img) -> str:
     config = "--oem 3 --psm 6 -l tha+eng"
     return pytesseract.image_to_string(img, config=config)
 
-# ---------- Regex Extraction (FIXED) ----------
-# Use NON-NAMED amount pattern to avoid duplicate named group errors
-AMOUNT_PAT = r"(-?\d[\d,\s]*\.?\d{0,2})"
+def normalize_qt_code(raw: str) -> str:
+    if not raw: return raw
+    s = raw.strip()
+    table = str.maketrans({"$": "S", "§": "S"})
+    s = s.translate(table)
+    s = re.sub(r"^[Kk]5", "KS", s)
+    s = re.sub(r"^5", "S", s)
+    s = fix_numberlike_ocr(s)
+    s = s.replace(" ", "")
+    return s.upper()
+
+def line_numbers_preferring_big(s: str) -> List[float]:
+    s_no_pct = re.sub(r"\d+(\.\d+)?\s*%", "", s)
+    s_no_pct = fix_numberlike_ocr(s_no_pct)
+    nums = re.findall(r"-?\d[\d,]*\.?\d*", s_no_pct)
+    vals = []
+    for n in nums:
+        v = normalize_number(n)
+        if v is None: 
+            continue
+        if v >= 100 or ("," in n) or ("." in n):
+            vals.append(v)
+    if not vals:
+        for n in nums:
+            v = normalize_number(n)
+            if v is not None:
+                vals.append(v)
+    return vals
 
 def find_amount_near(text: str, keys: List[str]) -> Optional[float]:
-    """Find amount near given keywords. Escapes keys to avoid regex meta, and avoids duplicate named groups."""
     s = sanitize_text(text)
-    for key in keys:
-        k = re.escape(key)  # escape keyword literal
-        # key ... amount
-        m = re.search(rf"{k}[^\d\-]*{AMOUNT_PAT}", s, flags=re.IGNORECASE)
-        if m:
-            return normalize_number(m.group(1))
-        # amount ... key
-        m = re.search(rf"{AMOUNT_PAT}[^\d\-]*{k}", s, flags=re.IGNORECASE)
-        if m:
-            return normalize_number(m.group(1))
-    # fallback: last numeric looking amount
-    nums = re.findall(AMOUNT_PAT, s)
-    if nums:
-        return normalize_number(nums[-1])
+    lines = [l.strip() for l in s.splitlines() if l.strip()]
+    low = [k.lower() for k in keys]
+    for i, l in enumerate(lines):
+        ll = l.lower()
+        if any(k in ll for k in low):
+            cand_vals = line_numbers_preferring_big(l)
+            if i + 1 < len(lines):
+                cand_vals += line_numbers_preferring_big(lines[i+1])
+            if cand_vals:
+                return max(cand_vals)
     return None
 
 def extract_vendor(text: str) -> Optional[str]:
@@ -189,15 +211,23 @@ def extract_vendor(text: str) -> Optional[str]:
 
 def extract_qt_no(text: str) -> Optional[str]:
     t = sanitize_text(text)
-    pat = r"(quotation\s*no\.?|quotation\s*#|qt\s*no\.?|เลขที่ใบเสนอราคา|เลขที่[:\s]|ref\s*no\.?)\s*[:#]?\s*([A-Za-z0-9\/\-\._]{3,})"
-    m = re.search(pat, t, flags=re.IGNORECASE)
-    if m: return m.group(2)
-    m = re.search(r"\b[A-Z]{1,4}[-/_.]?\d{2,4}[-/_.]?\d{1,6}\b", t)
-    if m: return m.group(0)
+    m = re.search(r"(quotation\s*no\.?|quotation\s*#|qt\s*no\.?|เลขที่ใบเสนอราคา|เลขที่[:\s]|ref\s*no\.?)\s*[:#]?\s*([A-Za-z0-9\$§\/\-\._]{3,})", t, flags=re.IGNORECASE)
+    if m:
+        return normalize_qt_code(m.group(2))
+    m = re.search(r"\b[A-Z\$§]{1,4}[-/_.]?\d{2,4}[-/_.]?\d{1,6}\b", t, flags=re.IGNORECASE)
+    if m:
+        return normalize_qt_code(m.group(0))
     return None
 
 def extract_description(text: str) -> Optional[str]:
     t = sanitize_text(text)
+    if "product description" in t.lower():
+        after = t.lower().split("product description", 1)[1]
+        after = re.split(r"(payment\s*term|terms\s*&?\s*conditions|total|vat|grand\s*total)", after, flags=re.IGNORECASE)[0]
+        after = re.sub(r"\b(qty\.?|price per.*|total price.*)\b", "", after, flags=re.IGNORECASE)
+        line = [ln.strip() for ln in after.splitlines() if len(ln.strip()) >= 10]
+        if line:
+            return line[0][:180]
     m = re.search(r"(description|รายละเอียด|รายการ)\s*[:\-]?\s*(.+)", t, flags=re.IGNORECASE|re.DOTALL)
     if m:
         tail = m.group(2).strip()
@@ -216,14 +246,28 @@ def extract_fields(full_text: str) -> Dict[str, Optional[str]]:
     vendor = extract_vendor(txt)
     qt_no  = extract_qt_no(txt)
     date_iso = parse_date_candidates(txt)
-    subtotal = find_amount_near(txt, ["subtotal", "รวมก่อนภาษี", "ยอดก่อนภาษี"])
-    vat      = find_amount_near(txt, ["vat", "ภาษีมูลค่าเพิ่ม", "vat 7", "ภาษี 7"])
-    grand    = find_amount_near(txt, ["grand total", "ยอดรวมสุทธิ", "net total", "รวมทั้งสิ้น", "ยอดชำระสุทธิ"])
-    if grand is not None and subtotal is not None and vat is None:
+
+    subtotal = find_amount_near(txt, ["subtotal", "รวมก่อนภาษี", "ยอดก่อนภาษี", "total"])
+    grand    = find_amount_near(txt, ["grand total", "ยอดรวมสุทธิ", "รวมทั้งสิ้น", "ยอดชำระสุทธิ"])
+    vat      = find_amount_near(txt, ["vat", "ภาษีมูลค่าเพิ่ม"])
+
+    if vat is not None and vat < 50 and re.search(r"vat\s*7\s*%|ภาษี\s*7\s*%", txt, flags=re.IGNORECASE):
+        if grand is not None and subtotal is not None:
+            vat = round(grand - subtotal, 2)
+        elif subtotal is not None:
+            vat = round(subtotal * 0.07, 2)
+        elif grand is not None:
+            vat = None
+
+    if grand is not None and subtotal is not None:
         vat = round(grand - subtotal, 2)
-    if vat is not None and subtotal is None and grand is not None:
+    if vat is not None and grand is not None and subtotal is None:
         subtotal = round(grand - vat, 2)
+    if vat is not None and subtotal is not None and grand is None:
+        grand = round(subtotal + vat, 2)
+
     desc = extract_description(txt)
+
     return {
         "Vendor/Supplier": vendor,
         "Quotation No.": qt_no,
@@ -235,7 +279,6 @@ def extract_fields(full_text: str) -> Dict[str, Optional[str]]:
         "Raw Text": txt,
     }
 
-# ---------- Google Sheets Export ----------
 def export_to_google_sheets(df: pd.DataFrame, sheet_url: str, service_json: dict, worksheet_name: str = "OCR_QT"):
     try:
         import gspread
@@ -253,7 +296,6 @@ def export_to_google_sheets(df: pd.DataFrame, sheet_url: str, service_json: dict
     except Exception as e:
         return False, f"Export failed: {e}"
 
-# ---------- Streamlit UI ----------
 st.set_page_config(page_title="OCR ใบเสนอราคา/บิล → สรุปตาราง", layout="wide")
 st.title("🧾 OCR ใบเสนอราคา/บิล ➜ สรุปเป็นตาราง")
 st.caption("Pre-process ➜ OCR (EasyOCR/Tesseract) ➜ Regex/NER ➜ Export Google Sheets")
@@ -294,7 +336,6 @@ if uploads:
             st.write("**OCR Output (Raw Text)**")
             text_easy = ""
             text_tess = ""
-
             if engine in ["Hybrid (EasyOCR ➜ fallback Tesseract)","EasyOCR only"] and EASYOCR_AVAILABLE:
                 try:
                     text_easy = ocr_easyocr(steps["original"])
@@ -317,8 +358,8 @@ if uploads:
                 raw = text_easy if len(text_easy) >= len(text_tess) else text_tess
                 if not raw and text_easy:
                     raw = text_easy
-
             st.text_area("Raw Text", value=raw, height=260)
+
             fields = extract_fields(raw or "")
             row = {
                 "file": up.name,
@@ -350,8 +391,10 @@ if rows:
             (st.success if ok else st.error)(msg)
 
 st.markdown("---")
-with st.expander("ℹ️ Tips / Notes"):
+with st.expander("ℹ️ Notes on accuracy"):
     st.markdown("""
-- แก้ **re.PatternError** แล้ว: ใช้แพทเทิร์นจำนวนเงินแบบ **ไม่มีชื่อกลุ่ม** และ `re.escape()` กับคีย์เวิร์ด
-- ถ้าเจอ `TesseractNotFoundError` ให้ใส่ path ทางซ้าย หรือใช้ **packages.txt** บน Streamlit Cloud
+- ข้ามตัวเลขที่เป็นเปอร์เซ็นต์ แล้วเลือกจำนวนเงินที่ใหญ่ที่สุดใกล้คีย์เวิร์ด
+- แก้ `10o,ooo.00` ➜ `100000.00`, `B` ➜ `8`, `I/l` ➜ `1`
+- Quotation No.: รองรับ `k$2209191` ➜ `KS2209191`
+- Description: ดึงบรรทัดใต้ **Product Description** ก่อน แล้วค่อย fallback วิธีเดิม
 """)
