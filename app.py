@@ -67,18 +67,15 @@ def parse_date_candidates(text: str) -> Optional[str]:
 
 # ---------------- Preprocessing ----------------
 def binarize_for_tesseract(gray):
-    # adaptive + ensure "black text on white"
     th = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,31,9)
-    # ถ้าส่วนขาวมากเกิน 0.8 แสดงว่าขาวทั้งหน้า → ใช้ Otsu
     if (th==255).mean() > 0.92:
         _, th = cv2.threshold(gray,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-    # ถ้าขาวมากกว่า 0.6 → กลับสี (ต้องการพื้นขาว)
     if (th==0).mean() > 0.6:
         th = 255 - th
     return th
 
 def deskew(binary_img: np.ndarray)->Tuple[np.ndarray,float]:
-    coords = np.column_stack(np.where(binary_img<128))  # จุดดำเป็นตัวหนังสือ
+    coords = np.column_stack(np.where(binary_img<128))
     if coords.size==0: return binary_img, 0.0
     angle = cv2.minAreaRect(coords)[-1]
     angle = -(90 + angle) if angle < -45 else -angle
@@ -125,7 +122,6 @@ def ensure_tesseract(user_path: Optional[str]):
 def ocr_data(img_bin) -> pd.DataFrame:
     df = pytesseract.image_to_data(img_bin, config="--oem 3 --psm 6 -l tha+eng", output_type=Output.DATAFRAME)
     df = df.dropna(subset=["text"]).copy()
-    # กรอง noise ด้วยความมั่นใจ
     if "conf" in df.columns:
         df = df[df["conf"].astype(float) > 40].copy()
     df["text"] = df["text"].astype(str)
@@ -133,7 +129,6 @@ def ocr_data(img_bin) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 def ocr_text_best(img_bin) -> str:
-    # ทดลองหลาย psm เลือกอันที่ยาวสุด
     outs=[]
     for psm in (6,4,11,12):
         outs.append(pytesseract.image_to_string(img_bin, config=f"--oem 3 --psm {psm} -l tha+eng"))
@@ -209,14 +204,13 @@ def extract_header(df_words: pd.DataFrame)->Tuple[Optional[str], Optional[str]]:
     qt, dt = None, None
     if ql is not None:
         tx = " ".join(right_tokens(df_words, ql))
-        qs = re.findall(r"[A-Za-z][A-Za-z0-9/_\-.]{5,}", tx)  # เช่น KS2209191
+        qs = re.findall(r"[A-Za-z][A-Za-z0-9/_\-.]{5,}", tx)
         if qs: qt = max(qs, key=len).upper()
         dt = parse_date_candidates(tx)
     if dt is None:
         dl = find_line(ln, ["date","วันที่"], prefer_last=False)
         if dl is not None:
             dt = parse_date_candidates(" ".join(right_tokens(df_words, dl)))
-    # fallback หา code จากทั้งหน้า
     if qt is None:
         alltxt = " ".join(ln["text"].tolist())
         m = re.search(r"\b[A-Z]{1,3}[0-9]{6,}\b", alltxt)
@@ -225,7 +219,6 @@ def extract_header(df_words: pd.DataFrame)->Tuple[Optional[str], Optional[str]]:
 
 def extract_amounts(df_words: pd.DataFrame, page_w:int)->Tuple[Optional[float], Optional[float], Optional[float]]:
     ln = lines_from_df(df_words)
-    # เฉพาะคอลัมน์ขวา (จำนวนเงิน)
     right_lines = ln[(ln["right"] > page_w*0.55)]
     gl = find_line(right_lines, ["grand total","ยอดรวมสุทธิ","รวมทั้งสิ้น","ยอดชำระสุทธิ"], prefer_last=True)
     vl = find_line(right_lines, ["vat","ภาษีมูลค่าเพิ่ม"], prefer_last=True)
@@ -235,33 +228,24 @@ def extract_amounts(df_words: pd.DataFrame, page_w:int)->Tuple[Optional[float], 
     vat   = rightmost_number_on_line(df_words, vl) if vl is not None else None
     sub   = rightmost_number_on_line(df_words, sl) if sl is not None else None
 
-    # Fallback: เลือก 3 บรรทัดล่างสุดที่เป็นจำนวนเงินในคอลัมน์ขวา
     if grand is None or sub is None:
         money_rows=[]
         for _,r in right_lines.iterrows():
             v = rightmost_number_on_line(df_words, r)
             if v is not None: money_rows.append((r["top"], v, r))
-        money_rows = sorted(money_rows, key=lambda x:x[0])  # ตามแนวตั้ง
+        money_rows = sorted(money_rows, key=lambda x:x[0])
         if len(money_rows)>=2:
-            # สองค่าล่างสุดคือ grand / vat|subtotal
             tail = [v for _,v,_ in money_rows[-3:]]
             tail = sorted(tail)
-            # ค่ามากสุด = grand
             if grand is None: grand = tail[-1]
-            # ถ้ามี 7% ให้คำนวณ vat/sub
-            if sub is None and grand is not None and len(tail)>=2:
-                # เดาทาง: ที่รองลงมาอาจเป็น subtotal
-                sub = tail[-2]
-            if vat is None and grand is not None and sub is not None:
-                vat = round(grand - sub, 2)
+            if sub is None and len(tail)>=2: sub = tail[-2]
+            if vat is None and grand is not None and sub is not None: vat = round(grand - sub, 2)
 
-    # Heuristic 7%
     all_text = " ".join(ln["text"].tolist())
     if vat is not None and vat < 50 and re.search(r"vat\s*7\s*%|ภาษี\s*7\s*%", all_text, flags=re.I):
         if grand is not None and sub is not None: vat = round(grand - sub, 2)
         elif sub is not None: vat = round(sub * 0.07, 2)
 
-    # Reconcile
     if grand is None and sub is not None and vat is not None: grand = round(sub + vat, 2)
     if sub is None and grand is not None and vat is not None: sub = round(grand - vat, 2)
     if vat is None and grand is not None and sub is not None: vat = round(grand - sub, 2)
@@ -274,7 +258,7 @@ def pdf_to_bgr_list(file_bytes: bytes, dpi: int = 300) -> List[np.ndarray]:
         for p in doc:
             pix = p.get_pixmap(dpi=dpi, alpha=False)
             img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-            out.append(img[:,:,::-1])  # BGR
+            out.append(img[:,:,::-1])
     return out
 
 # ---------------- Google Sheets ----------------
@@ -325,12 +309,33 @@ if uploads:
 
         for pidx, img_bgr in enumerate(pages, start=1):
             steps = preprocess(img_bgr)
-            col1,col2 = st.columns([1,1])
-            with col1:
+
+            c1,c2 = st.columns([1,1])
+            with c1:
                 if show_steps:
-                    tabs = st.tabs(list(steps.keys()))
-                    for tb,k in zip(tabs, steps.keys()):
-                        with tb: st.image(steps[k], caption=f"{k} (page {pidx})", use_container_width=True)
+                    keys = list(steps.keys())
+                    tabs = st.tabs(keys)
+                    for i, name in enumerate(keys):
+                        img = steps[name]
+                        with tabs[i]:
+                            try:
+                                if isinstance(img, np.ndarray):
+                                    if img.ndim == 2:
+                                        # ensure uint8 and clamp for grayscale/binary
+                                        if img.dtype != np.uint8:
+                                            img = img.astype(np.uint8)
+                                        st.image(img, caption=f"{name} (page {pidx})",
+                                                 use_column_width=True, clamp=True)
+                                    elif img.ndim == 3:
+                                        st.image(img, caption=f"{name} (page {pidx})",
+                                                 use_column_width=True)
+                                    else:
+                                        st.write("ไม่สามารถแสดงภาพรูปแบบนี้ได้")
+                                elif isinstance(img, Image.Image):
+                                    st.image(img, caption=f"{name} (page {pidx})",
+                                             use_column_width=True)
+                            except Exception as e:
+                                st.write(f"⚠️ แสดงรูป {name} ไม่ได้: {e}")
 
             df_words = ocr_data(steps["upscale(1.8x)"])
             page_h, page_w = steps["original"].shape[:2]
@@ -344,7 +349,7 @@ if uploads:
             except Exception as e:
                 raw = f"[Tesseract error] {e}"
 
-            with col2:
+            with c2:
                 st.text_area(f"OCR Output (Raw Text) — page {pidx}", value=raw, height=220)
                 rec = {
                     "file": f"{up.name}#p{pidx}",
