@@ -1,31 +1,32 @@
-# ต้องอยู่เป็นบรรทัดแรกเพื่อกัน SessionInfo error
+# ต้องอยู่บรรทัดแรก: กัน SessionInfo error
 import streamlit as st
 st.set_page_config(page_title="OCR ใบเสนอราคา/บิล → สรุปตาราง", layout="wide")
 
 import os, re, json, shutil
 from typing import Dict, List, Tuple, Optional
+
 import numpy as np
 import pandas as pd
 from PIL import Image
 import cv2
+import fitz           # PyMuPDF
 import dateparser
-import fitz  # PyMuPDF
 
-# --- OCR: pytesseract ---
+# ---- OCR (Tesseract) ----
 try:
     import pytesseract
 except Exception:
     pytesseract = None
 
-# ----------------------------- helpers: text -----------------------------
-TH_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
+# ====== Text helpers ======
+TH_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙","0123456789")
 TH_MONTHS = {
     "ม.ค.":"มกราคม","ก.พ.":"กุมภาพันธ์","มี.ค.":"มีนาคม","เม.ย.":"เมษายน",
     "พ.ค.":"พฤษภาคม","มิ.ย.":"มิถุนายน","ก.ค.":"กรกฎาคม","ส.ค.":"สิงหาคม",
     "ก.ย.":"กันยายน","ต.ค.":"ตุลาคม","พ.ย.":"พฤศจิกายน","ธ.ค.":"ธันวาคม"
 }
 def to_en_digits(s:str)->str: return s.translate(TH_DIGITS) if isinstance(s,str) else s
-def fix_numberlike_ocr(s:str)->str:
+def fix_numberlike(s:str)->str:
     if not isinstance(s,str): return s
     s = re.sub(r'(?<=\d)[oO](?=[\d,\.])','0',s)
     s = re.sub(r'(?<=[,\.\s])[oO](?=\d)','0',s)
@@ -40,7 +41,7 @@ def sanitize_text(t:str)->str:
     return t
 def normalize_number(s:str)->Optional[float]:
     if not s: return None
-    s = fix_numberlike_ocr(to_en_digits(s))
+    s = fix_numberlike(to_en_digits(s))
     s = s.replace(" ","").replace(",","").replace("฿","").replace("บาท","").replace("%","")
     m = re.findall(r"-?\d+(?:\.\d+)?", s)
     return float(m[0]) if m else None
@@ -60,7 +61,7 @@ def parse_date_candidates(text:str)->Optional[str]:
             parsed.append(dt.date())
     return (sorted(parsed)[-1].isoformat() if parsed else None)
 
-# --------------------------- preprocessing ---------------------------
+# ====== Pre-processing ======
 def deskew(binary_img: np.ndarray)->Tuple[np.ndarray,float]:
     coords=np.column_stack(np.where(binary_img>0))
     if coords.size==0: return binary_img,0.0
@@ -69,7 +70,8 @@ def deskew(binary_img: np.ndarray)->Tuple[np.ndarray,float]:
     (h,w)=binary_img.shape[:2]
     M=cv2.getRotationMatrix2D((w//2,h//2),angle,1.0)
     rotated=cv2.warpAffine(binary_img,M,(w,h),flags=cv2.INTER_CUBIC,borderMode=cv2.BORDER_REPLICATE)
-    return rotated,angle
+    return rotated, angle
+
 def preprocess(img_bgr: np.ndarray)->Dict[str,np.ndarray]:
     out={}
     out["original"]=cv2.cvtColor(img_bgr,cv2.COLOR_BGR2RGB)
@@ -82,13 +84,13 @@ def preprocess(img_bgr: np.ndarray)->Dict[str,np.ndarray]:
     opened=cv2.morphologyEx(up,cv2.MORPH_OPEN,np.ones((2,2),np.uint8),iterations=1); out["morph_open"]=opened
     return out
 
-# ---------------------------- tesseract ----------------------------
+# ====== Tesseract helpers ======
 def ensure_tesseract(user_path: Optional[str]):
     if pytesseract is None: return (False,None,"pytesseract not installed")
     cand=[]
     if user_path: cand.append(user_path)
-    cand+=["/usr/bin/tesseract","/usr/local/bin/tesseract","/opt/homebrew/bin/tesseract",
-           r"C:\Program Files\Tesseract-OCR\tesseract.exe", r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"]
+    cand += ["/usr/bin/tesseract","/usr/local/bin/tesseract","/opt/homebrew/bin/tesseract",
+             r"C:\Program Files\Tesseract-OCR\tesseract.exe", r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"]
     for p in cand:
         if os.path.exists(p):
             try:
@@ -106,58 +108,50 @@ def ensure_tesseract(user_path: Optional[str]):
             return False,exe,str(e)
     return False,None,"tesseract not found"
 
-def tesseract_text(img, psm=6, lang="tha+eng", whitelist=None)->str:
+def tess_text(img, psm=6, lang="tha+eng", whitelist=None):
     cfg=f"--oem 3 --psm {psm} -l {lang}"
-    if whitelist: cfg+=f" -c tessedit_char_whitelist={whitelist}"
+    if whitelist: cfg += f" -c tessedit_char_whitelist={whitelist}"
     return pytesseract.image_to_string(img, config=cfg)
 
-def tesseract_df(img_rgb)->pd.DataFrame:
+def tess_df(img)->pd.DataFrame:
+    # ใช้ binary ที่ upscaled เพื่อ segmentation ดีขึ้น
     cfg="--oem 3 --psm 6 -l tha+eng"
-    df=pytesseract.image_to_data(img_rgb, config=cfg, output_type=pytesseract.Output.DATAFRAME)
+    df=pytesseract.image_to_data(img, config=cfg, output_type=pytesseract.Output.DATAFRAME)
     df=df.dropna(subset=["text"]).copy()
-    df["text"] = df["text"].astype(str)
+    df["text"]=df["text"].astype(str)
     df["norm"]=df["text"].str.lower().str.replace(r"[^a-z0-9ก-๙]+","",regex=True)
     return df
 
-# ------------------------ line & ROI utilities ------------------------
+# ====== Lines & ROI ======
 def lines_from_df(df: pd.DataFrame)->pd.DataFrame:
-    # สรุปเป็นบรรทัด (page, block, par, line)
-    gcols=["page_num","block_num","par_num","line_num"]
-    agg=df.groupby(gcols).agg(
-        left=("left","min"), top=("top","min"),
-        right=("left","max"), bottom=("top","max"),
-        height=("height","max")
-    ).reset_index()
-    texts=df.groupby(gcols)["text"].apply(lambda s:" ".join([x for x in s if x.strip()])).reset_index(name="text")
-    norms=df.groupby(gcols)["norm"].apply(lambda s:"".join([x for x in s if x.strip()])).reset_index(name="norm")
-    ln=agg.merge(texts,on=gcols).merge(norms,on=gcols)
-    ln["right"]=ln["right"]+df.groupby(gcols)["width"].max().values
+    g=["page_num","block_num","par_num","line_num"]
+    agg=df.groupby(g).agg(left=("left","min"), top=("top","min"),
+                          right=("left","max"), bottom=("top","max"),
+                          height=("height","max")).reset_index()
+    texts=df.groupby(g)["text"].apply(lambda s:" ".join([x for x in s if x.strip()])).reset_index(name="text")
+    norms=df.groupby(g)["norm"].apply(lambda s:" ".join([x for x in s if x.strip()])).reset_index(name="norm")
+    ln=agg.merge(texts,on=g).merge(norms,on=g)
+    ln["right"]=ln["right"]+df.groupby(g)["width"].max().values
     return ln
 
-def find_line(ln: pd.DataFrame, keywords: List[str], prefer_last=False)->Optional[pd.Series]:
-    ks=[re.sub(r"[^a-z0-9ก-๙]+","",k.lower()) for k in keywords]
-    cand=ln[ln["norm"].apply(lambda s:any(k in s for k in ks))]
+def find_line2(ln: pd.DataFrame, include: List[str], exclude: List[str]=None, prefer_last=False)->Optional[pd.Series]:
+    if exclude is None: exclude=[]
+    inc=[re.sub(r"[^a-z0-9ก-๙]+","",k.lower()) for k in include]
+    exc=[re.sub(r"[^a-z0-9ก-๙]+","",k.lower()) for k in exclude]
+    def ok(s):
+        s=re.sub(r"[^a-z0-9ก-๙]+","",s.lower())
+        return any(k in s for k in inc) and not any(x in s for x in exc)
+    cand=ln[ln["text"].apply(ok)]
     if cand.empty: return None
-    cand = cand.sort_values(["page_num","top","left"])
+    cand=cand.sort_values(["page_num","top","left"])
     return cand.iloc[-1] if prefer_last else cand.iloc[0]
 
-def right_text_on_line(df_words: pd.DataFrame, line_row: pd.Series, cutoff_x: int)->str:
-    mask = (df_words["page_num"]==line_row["page_num"]) & \
-           (df_words["block_num"]==line_row["block_num"]) & \
-           (df_words["par_num"]==line_row["par_num"]) & \
-           (df_words["line_num"]==line_row["line_num"]) & \
-           (df_words["left"]>cutoff_x+5)
-    words = df_words[mask].sort_values("left")["text"].tolist()
-    return " ".join(words)
-
 def rightmost_number_on_line(df_words: pd.DataFrame, line_row: pd.Series)->Optional[float]:
-    mask = (df_words["page_num"]==line_row["page_num"]) & \
-           (df_words["block_num"]==line_row["block_num"]) & \
-           (df_words["par_num"]==line_row["par_num"]) & \
-           (df_words["line_num"]==line_row["line_num"])
-    sub=df_words[mask].copy()
-    # เอาเลขตัวที่อยู่ขวาสุดในบรรทัด
-    sub=sub.sort_values("left")
+    mask=(df_words["page_num"]==line_row["page_num"]) & \
+         (df_words["block_num"]==line_row["block_num"]) & \
+         (df_words["par_num"]==line_row["par_num"]) & \
+         (df_words["line_num"]==line_row["line_num"])
+    sub=df_words[mask].sort_values("left")
     nums=[]
     for _,r in sub.iterrows():
         if re.fullmatch(r"\d[\d,]*\.?\d*", r["text"]):
@@ -166,60 +160,66 @@ def rightmost_number_on_line(df_words: pd.DataFrame, line_row: pd.Series)->Optio
         return nums[-1][1]
     return None
 
-# ----------------------- vendor / fields extraction -----------------------
-VENDOR_PAT = r"(บริษัท.+จำกัด|บริษัท.+จำกัด\(มหาชน\)|ห้างหุ้นส่วนจำกัด|หจก\.|co\.,?\s*ltd\.?|solutions\s*&\s*consultants\s*co\.,?\s*ltd\.?|company\s*limited)"
+# ====== Field extraction ======
+BAD_VENDOR_WORDS = r"(customer|address|project|quotation|page[:\s]|date[:\s])"
+VENDOR_PAT = r"(บริษัท.+จำกัด|บริษัท.+จำกัด\(มหาชน\)|ห้างหุ้นส่วนจำกัด|หจก\.|co\.,?\s*ltd\.?|company\s*limited)"
 
 def extract_vendor_by_position(df_words: pd.DataFrame, page_h: int)->Optional[str]:
     ln = lines_from_df(df_words)
-    top_band = ln[ln["top"] < page_h * 0.22]  # เฉพาะโซนหัวเอกสาร
-    if top_band.empty: top_band = ln[ln["top"] < page_h * 0.35]
-    # กรองคำว่า customer/project/address ออก
-    def bad(s): return re.search(r"(customer|address|project|page[:\s]|date[:\s]|quotation)", s, flags=re.I)
-    cand = top_band[~top_band["text"].apply(lambda s: bool(bad(s)))]
-    # เลือกประโยคที่ match รูปแบบชื่อบริษัท + ยาวสุด
-    m1=cand[cand["text"].str.contains(VENDOR_PAT, flags=re.I, regex=True)]
-    if not m1.empty:
-        return m1.iloc[m1["text"].str.len().argmax()]["text"].strip()
-    # ถ้าไม่เจอ ให้เอาบรรทัดบนสุดที่ยาวสุด (มักเป็นชื่อบริษัทภาษาไทย)
-    return cand.iloc[cand["text"].str.len().argmax()]["text"].strip() if not cand.empty else None
+    head = ln[ln["top"] < page_h*0.25]
+    if head.empty: head = ln[ln["top"] < page_h*0.35]
+    cand = head[~head["text"].str.contains(BAD_VENDOR_WORDS, flags=re.I, regex=True, na=False)]
+    pri = pd.Series(0, index=cand.index, dtype=float)
+    pri += cand["text"].str.contains(r"บริษัท|จำกัด", regex=True).astype(int)*2
+    pri += cand["text"].str.contains(r"co\.,?\s*ltd\.?|company\s*limited", flags=re.I, regex=True).astype(int)*2
+    pri += cand["text"].str.contains(r"solutions|consultants|askme", flags=re.I, regex=True).astype(int)
+    if not cand.empty:
+        target = cand.loc[pri.idxmax()]
+        return target["text"].strip()
+    return None
 
 def extract_header_fields(df_words: pd.DataFrame)->Tuple[Optional[str], Optional[str]]:
     ln = lines_from_df(df_words)
-    ql = find_line(ln, ["quotation no","quotation"], prefer_last=False)
-    qt = None; dt = None
+    ql = find_line2(ln, ["quotation no","quotation"], exclude=[], prefer_last=False)
+    qt, dt = None, None
     if ql is not None:
-        # cutoff ที่ท้าย token 'quotation' หรือ 'quotation no'
-        cutoff = ql["left"] + (ql["right"] - ql["left"])//2
-        right_txt = right_text_on_line(df_words, ql, cutoff)
-        # โค้ดใบเสนอราคา: เอา alnum/_- ยาวที่สุด
-        tokens = re.findall(r"[A-Za-z0-9/_\-.]{5,}", right_txt)
-        if tokens:
-            qt = max(tokens, key=len).upper()
-        # date: หาในบรรทัดเดียวหรือบรรทัดถัดไป
+        # ข้อความขวาของกึ่งกลางบรรทัด
+        cutoff = ql["left"] + (ql["right"]-ql["left"])//2
+        # ดึงคำทางขวาใน line นี้จาก df_words
+        mask=(df_words["page_num"]==ql["page_num"]) & (df_words["block_num"]==ql["block_num"]) & \
+             (df_words["par_num"]==ql["par_num"]) & (df_words["line_num"]==ql["line_num"]) & \
+             (df_words["left"]>cutoff+5)
+        words=df_words[mask].sort_values("left")["text"].tolist()
+        right_txt=" ".join(words)
+        # Quotation code
+        toks = re.findall(r"[A-Za-z0-9/_\-.]{6,}", right_txt)
+        if toks: qt = max(toks, key=len).upper()
+        # date
         dt = parse_date_candidates(right_txt)
-        if dt is None:
-            # มองบรรทัดถัดไปใน block เดียวกัน
-            next_line = ln[(ln["page_num"]==ql["page_num"]) & (ln["block_num"]==ql["block_num"]) &
-                           (ln["par_num"]==ql["par_num"]) & (ln["line_num"]==ql["line_num"]+1)]
-            if not next_line.empty:
-                rt = right_text_on_line(df_words, next_line.iloc[0], next_line.iloc[0]["left"])
-                dt = parse_date_candidates(rt)
+    if dt is None:  # สำรอง: หา "Date:"
+        dl = find_line2(ln, ["date","วันที่"], prefer_last=False)
+        if dl is not None:
+            mask=(df_words["page_num"]==dl["page_num"]) & (df_words["block_num"]==dl["block_num"]) & \
+                 (df_words["par_num"]==dl["par_num"]) & (df_words["line_num"]==dl["line_num"]) & \
+                 (df_words["left"]>(dl["left"]+(dl["right"]-dl["left"])//2))
+            words=df_words[mask].sort_values("left")["text"].tolist()
+            dt = parse_date_candidates(" ".join(words))
     return qt, dt
 
 def extract_amounts(df_words: pd.DataFrame)->Tuple[Optional[float], Optional[float], Optional[float]]:
     ln = lines_from_df(df_words)
-    # ใช้ prefer_last=True เพื่อเลือกแถวด้านล่างของตาราง (ใกล้ผลรวม)
-    gl = find_line(ln, ["grand total","ยอดรวมสุทธิ","รวมทั้งสิ้น","ยอดชำระสุทธิ"], prefer_last=True)
-    vl = find_line(ln, ["vat","ภาษีมูลค่าเพิ่ม"], prefer_last=True)
-    sl = find_line(ln, ["subtotal","รวมก่อนภาษี","ยอดก่อนภาษี","total"], prefer_last=True)
+    # เลือกบรรทัดจริงด้วย include/exclude
+    gl = find_line2(ln, ["grand total","ยอดรวมสุทธิ","รวมทั้งสิ้น","ยอดชำระสุทธิ"], exclude=[], prefer_last=True)
+    vl = find_line2(ln, ["vat","ภาษีมูลค่าเพิ่ม"], exclude=[], prefer_last=True)
+    sl = find_line2(ln, ["subtotal","รวมก่อนภาษี","ยอดก่อนภาษี","total"], exclude=["grand","vat"], prefer_last=True)
 
     grand = rightmost_number_on_line(df_words, gl) if gl is not None else None
     vat   = rightmost_number_on_line(df_words, vl) if vl is not None else None
     sub   = rightmost_number_on_line(df_words, sl) if sl is not None else None
 
-    # reconcile
-    text_all = " ".join(lines_from_df(df_words)["text"].tolist())
-    if vat is not None and vat < 50 and re.search(r"vat\s*7\s*%|ภาษี\s*7\s*%", text_all, flags=re.I):
+    # reconcile & heuristics 7%
+    all_text = " ".join(ln["text"].tolist())
+    if vat is not None and vat < 50 and re.search(r"vat\s*7\s*%|ภาษี\s*7\s*%", all_text, flags=re.I):
         if grand is not None and sub is not None: vat = round(grand - sub, 2)
         elif sub is not None: vat = round(sub * 0.07, 2)
     if grand is None and sub is not None and vat is not None: grand = round(sub + vat, 2)
@@ -228,7 +228,7 @@ def extract_amounts(df_words: pd.DataFrame)->Tuple[Optional[float], Optional[flo
 
     return sub, vat, grand
 
-# ------------------------------ PDF helper ------------------------------
+# ====== PDF helper ======
 def pdf_to_bgr_list(file_bytes: bytes, dpi: int = 300)->List[np.ndarray]:
     out=[]
     with fitz.open(stream=file_bytes, filetype="pdf") as doc:
@@ -238,7 +238,7 @@ def pdf_to_bgr_list(file_bytes: bytes, dpi: int = 300)->List[np.ndarray]:
             out.append(img[:,:,::-1])  # BGR
     return out
 
-# ------------------------------ Google Sheets ------------------------------
+# ====== Google Sheets ======
 def export_to_google_sheets(df: pd.DataFrame, sheet_url: str, service_json: dict, worksheet_name: str="OCR_QT"):
     try:
         import gspread
@@ -255,10 +255,10 @@ def export_to_google_sheets(df: pd.DataFrame, sheet_url: str, service_json: dict
     except Exception as e:
         return False, f"Export failed: {e}"
 
-# -------------------------------- UI --------------------------------
+# ============================== UI ==============================
 with st.sidebar:
     st.header("⚙️ ตั้งค่า")
-    tess_path = st.text_input("Tesseract path (ถ้าระบบหาไม่เจอ)", "")
+    user_tess_path = st.text_input("Tesseract path (ถ้าระบบหาไม่เจอ)", "")
     show_steps = st.checkbox("แสดงภาพ Pre-processing", True)
     worksheet_name = st.text_input("Worksheet name (Google Sheets)", "OCR_QT")
     st.markdown("---")
@@ -266,10 +266,10 @@ with st.sidebar:
     sheet_url = st.text_input("ลิงก์ Google ชีท (แชร์สิทธิ์แก้ไขให้ Service Account)")
     service_json_file = st.file_uploader("อัปโหลด Service Account JSON", type=["json"], accept_multiple_files=False)
 
-TESS_OK, TESS_PATH, TESS_MSG = ensure_tesseract(tess_path.strip() or None)
+TESS_OK, TESS_PATH, TESS_MSG = ensure_tesseract(user_path=user_tess_path.strip() or None)
 st.sidebar.write("**Tesseract:** ", "✅ "+str(TESS_PATH) if TESS_OK else "❌ "+str(TESS_MSG))
 
-st.title("🧾 OCR ใบเสนอราคา/บิล ➜ สรุปเป็นตาราง (Guided by image_to_data)")
+st.title("🧾 OCR ใบเสนอราคา/บิล ➜ สรุปเป็นตาราง (line-guided + exclude keywords)")
 
 uploads = st.file_uploader("อัปโหลด JPG/PNG/PDF (หลายไฟล์ได้)", type=["jpg","jpeg","png","pdf"], accept_multiple_files=True)
 
@@ -295,22 +295,22 @@ if uploads:
                     for tb,k in zip(tabs, steps.keys()):
                         with tb: st.image(steps[k], caption=f"{k} (page {pidx})", use_column_width=True)
 
-            # ใช้ image_to_data เพื่อดึงข้อมูลแบบพิกัด
-            df_words = tesseract_df(steps["original"])
+            # ใช้ image_to_data กับภาพ binary ที่ upscale แล้ว
+            df_words = tess_df(steps["upscale(1.7x)"])
             page_h = steps["original"].shape[0]
 
             vendor = extract_vendor_by_position(df_words, page_h)
             qt, dt = extract_header_fields(df_words)
             sub, vat, grand = extract_amounts(df_words)
 
-            # debug raw text (ถ้าต้องการ)
+            # raw text (เพื่อ debug)
             try:
-                raw = tesseract_text(steps["morph_open"], psm=6, lang="tha+eng")
+                raw = tess_text(steps["morph_open"], psm=6, lang="tha+eng")
             except Exception as e:
                 raw = f"[Tesseract error] {e}"
+
             with col2:
                 st.text_area(f"OCR Output (Raw Text) — page {pidx}", value=raw, height=220)
-
                 row = {
                     "file": f"{up.name}#p{pidx}",
                     "Vendor / Supplier": vendor,
@@ -332,8 +332,8 @@ if rows:
                        file_name="ocr_quotation_results.csv", mime="text/csv")
     if sheet_url and service_json_file is not None:
         try:
-            service_dict = json.load(service_json_file)
-            ok, msg = export_to_google_sheets(df, sheet_url, service_dict, worksheet_name=worksheet_name)
+            svc = json.load(service_json_file)
+            ok, msg = export_to_google_sheets(df, sheet_url, svc, worksheet_name=worksheet_name)
             (st.success if ok else st.error)(msg)
         except Exception as e:
             st.error(f"อ่าน Service JSON ไม่ได้: {e}")
