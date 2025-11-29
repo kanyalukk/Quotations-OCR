@@ -4,7 +4,6 @@ st.set_page_config(page_title="OCR ใบเสนอราคา/บิล → 
 
 import os, re, json, shutil
 from typing import Dict, List, Tuple, Optional
-
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -30,6 +29,7 @@ def to_en_digits(s: str) -> str:
 
 def fix_numberlike(s: str) -> str:
     if not isinstance(s, str): return s
+    # อักษรที่มักเพี้ยนเป็นตัวเลข
     s = re.sub(r'(?<=\d)[oO](?=[\d,\.])','0',s)
     s = re.sub(r'(?<=[,\.\s])[oO](?=\d)','0',s)
     s = re.sub(r'(?<=\d)[lI](?=[\d,\.])','1',s)
@@ -45,22 +45,29 @@ def sanitize_text(t: str) -> str:
     return t
 
 def normalize_number(s: str) -> Optional[float]:
+    """รองรับทั้ง 107,000.00 และรูปแบบยุโรป 107.000,00"""
     if not s: return None
+    s0 = s
     s = fix_numberlike(to_en_digits(s))
-    s = s.replace(" ", "").replace(",", "").replace("฿","").replace("บาท","").replace("%","")
+    s = s.strip().replace("฿","").replace("บาท","")
+    # European: 1.234,56
+    if re.fullmatch(r"\d{1,3}(?:\.\d{3})+,\d{2}", s):
+        s = s.replace(".","").replace(",",".")
+    # US/TH: 1,234.56
+    s = s.replace(" ", "").replace(",", "")
     m = re.findall(r"-?\d+(?:\.\d+)?", s)
     return float(m[0]) if m else None
 
 def parse_date_candidates(text: str) -> Optional[str]:
     t = sanitize_text(text)
     c = set()
-    c.update(re.findall(r"(?:วันที่|date)[:\-\s]*([^\n]{1,40})", t, flags=re.I))
+    c.update(re.findall(r"(?:วันที่|date|issued\s*date|quotation\s*date)[:\-\s]*([^\n]{1,40})", t, flags=re.I))
     c.update(re.findall(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", t))
     c.update(re.findall(r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b", t))
     th = r"(มกราคม|กุมภาพันธ์|มีนาคม|เมษายน|พฤษภาคม|มิถุนายน|กรกฎาคม|สิงหาคม|กันยายน|ตุลาคม|พฤศจิกายน|ธันวาคม)"
     c.update(re.findall(rf"\b\d{{1,2}}\s*{th}\s*\d{{2,4}}\b", t))
     parsed=[]
-    for s in list(c)[:40]:
+    for s in list(c)[:50]:
         dt = dateparser.parse(s, languages=["th","en"], settings={"PREFER_DATES_FROM":"past","DATE_ORDER":"DMY"})
         if dt:
             if dt.year>2400: dt = dt.replace(year=dt.year-543)
@@ -166,11 +173,25 @@ def _ratio(a: str, b: str) -> float:
     return sm
 
 COMMON_FIX = {
-    "quotation no": ["quotationno","quotatlonno","quotatlon","quotation №","เลขที่ใบเสนอราคา"],
-    "date": ["วันที่","oate","dare"],
-    "subtotal": ["sub-total","sutotal","subtota|","subtotai","subtotl","รวมก่อนภาษี","ยอดก่อนภาษี"],
-    "vat": ["vat7%","vat 7 %","va7","ภาษีมูลค่าเพิ่ม","vat:"],
-    "grand total": ["grandtotai","grandtotl","grand tota|","ยอดรวมสุทธิ","รวมทั้งสิ้น","ยอดชำระสุทธิ"]
+    "quotation no": [
+        "quotationno","quotatlonno","quotatlon","quotation №",
+        "เลขที่ใบเสนอราคา","quotation number","quotation id","quote no","ref no"
+    ],
+    "date": [
+        "วันที่","oate","dare","quotation date","issue date","issued date",
+        "ใบเสนอราคาวันที่","เอกสารลงวันที่","doc date"
+    ],
+    "subtotal": [
+        "sub-total","sutotal","subtota|","subtotai","subtotl",
+        "รวมก่อนภาษี","ยอดก่อนภาษี","net total","amount before vat"
+    ],
+    "vat": [
+        "vat7%","vat 7 %","va7","ภาษีมูลค่าเพิ่ม","vat:","tax","vat amount"
+    ],
+    "grand total": [
+        "grandtotai","grandtotl","grand tota|","ยอดรวมสุทธิ","รวมทั้งสิ้น",
+        "ยอดชำระสุทธิ","total amount","amount due","total due"
+    ]
 }
 def expand_keywords(keys: List[str]) -> List[str]:
     out=set()
@@ -198,7 +219,7 @@ def find_line_fuzzy(ln: pd.DataFrame, include: List[str], exclude: List[str]=Non
     cand = cand.sort_values(["page_num","top","left","__score__"])
     return cand.iloc[-1] if prefer_last else cand.iloc[-1]
 
-# --------- tokens/values near anchor (ใหม่: ไม่บังคับอยู่บรรทัดเดียว) ----------
+# --------- tokens/values near anchor (ไม่บังคับอยู่บรรทัดเดียว) ----------
 def tokens_right_of_anchor(df_words: pd.DataFrame, anchor_row: pd.Series,
                            max_dx: int = 900, dy_factor: float = 1.4) -> List[str]:
     """เลือก token ที่อยู่ทางขวาของฉลาก (ภายในกรอบกว้าง max_dx และสูง dy_factor*height)"""
@@ -211,18 +232,19 @@ def tokens_right_of_anchor(df_words: pd.DataFrame, anchor_row: pd.Series,
            (df_words["top"] >= top_min) & (df_words["top"] <= top_max)
     return df_words[mask].sort_values(["top","left"])["text"].tolist()
 
-# ---------------- Vendor cleaner (ตัด “ตัวนำหนึ่งตัวอักษร” ออก) ----------------
+# ---------------- Vendor cleaner ----------------
 def _clean_vendor_line(s: str) -> str:
     s = " ".join(s.split())
-    # จับอังกฤษให้จบ Co., Ltd. / Company Limited และไม่ยอมให้มีอักษรเดี่ยวคั่นหน้า
+    # อังกฤษ: จบที่ Co., Ltd. / Company Limited และตัดอักษรเดี่ยวหน้า (เศษโลโก้)
     m = re.search(r"(?<![A-Za-z]\s)([A-Za-z][A-Za-z '&\.\-]+?(?:Co\.,?\s*Ltd\.|Company\s*Limited))", s, flags=re.I)
     if m:
         v = m.group(1).strip()
-        v = re.sub(r"^[A-Za-z]\s+(?=[A-Za-z])", "", v)  # ตัด "M " ที่มาจากโลโก้
+        v = re.sub(r"^[A-Za-z]\s+(?=[A-Za-z])", "", v)  # ตัด "M " จากโลโก้ที่มักติดมา
         v = re.sub(r"\s*,\s*", ", ", v)
         v = re.sub(r"\s+Co\.,?\s*Ltd\.?", " Co., Ltd.", v, flags=re.I)
         v = re.sub(r"\s+Company\s+Limited", " Company Limited", v, flags=re.I)
-        return v.strip()
+        v = re.sub(r"\s{2,}", " ", v).strip()
+        return v
     # ภาษาไทย
     m = re.search(r"(บริษัท.+?(?:จำกัด\(มหาชน\)|จำกัด))", s)
     if m:
@@ -238,15 +260,12 @@ def extract_vendor(df_words: pd.DataFrame, page_h: int) -> Optional[str]:
     head = head[~head["text"].str.contains(BAD_VENDOR, flags=re.I, regex=True, na=False)]
     head_text = " ".join(head.sort_values(["top","left"])["text"].tolist())
     head_text = " ".join(head_text.split())
-    # อังกฤษก่อน
     m = re.search(r"(?<![A-Za-z]\s)([A-Za-z][A-Za-z '&\.\-]+?(?:Co\.,?\s*Ltd\.|Company\s*Limited))", head_text, flags=re.I)
     if m:
         return _clean_vendor_line(m.group(1))
-    # ไทยรอง
     m = re.search(r"(บริษัท.+?(?:จำกัด\(มหาชน\)|จำกัด))", head_text)
     if m:
         return _clean_vendor_line(m.group(1))
-    # สำรอง: เลือกบรรทัดที่ดูเหมือนชื่อบริษัท
     if not head.empty:
         pri = pd.Series(0, index=head.index, dtype=float)
         pri += head["text"].str.contains(r"บริษัท|จำกัด", regex=True).astype(int)*2
@@ -270,12 +289,11 @@ def extract_header(df_words: pd.DataFrame)->Tuple[Optional[str], Optional[str]]:
             qs = re.findall(r"[A-Za-z][A-Za-z0-9/_\-.]{5,}", tx)
             if qs: qt = max(qs, key=len).upper()
     # Date (ใช้กรอบใกล้ขวาของคำว่า Date โดยตรง)
-    dl = find_line_fuzzy(ln, ["date","วันที่"], cutoff=0.60)
+    dl = find_line_fuzzy(ln, ["date","วันที่"], cutoff=0.55)
     if dl is not None:
         tokens = tokens_right_of_anchor(df_words, dl)
         dt = parse_date_candidates(" ".join(tokens))
     if dt is None:
-        # สำรอง: หาในทั้งหน้า
         alltxt = " ".join(ln["text"].tolist())
         dt = parse_date_candidates(alltxt)
     if qt is None:
@@ -292,48 +310,73 @@ def rightmost_number_on_line(df_words: pd.DataFrame, line_row: pd.Series) -> Opt
     sub = df_words[mask].sort_values("left")
     nums=[]
     for _,r in sub.iterrows():
-        if re.fullmatch(r"\d[\d,]*\.?\d*", r["text"]):
+        if re.fullmatch(r"\d[\d,\.]*", r["text"]):
             nums.append((r["left"], normalize_number(r["text"])))
     if nums: return nums[-1][1]
     return None
 
 def extract_amounts(df_words: pd.DataFrame, page_w:int, page_h:int=None)->Tuple[Optional[float], Optional[float], Optional[float]]:
     ln = lines_from_df(df_words)
-    right_lines = ln[(ln["right"] > page_w*0.55)]
-    if page_h is not None:
-        right_lines = right_lines[(right_lines["top"] > page_h*0.60)]
+    # --- โซนคาดการณ์สรุปยอด: ขวาล่าง & ซ้ายล่าง ---
+    ZONES = [
+        (0.55, 0.60, 0.98, 0.98),  # ขวาล่าง
+        (0.02, 0.60, 0.45, 0.98),  # ซ้ายล่าง (เผื่อบางฟอร์ม)
+    ]
+    candidates = []
 
-    gl = find_line_fuzzy(right_lines, ["grand total"], cutoff=0.66)
-    vl = find_line_fuzzy(right_lines, ["vat"], cutoff=0.60)
-    sl = find_line_fuzzy(right_lines, ["subtotal"], exclude=["grand","vat"], cutoff=0.60)
+    def amounts_in_lines(lines):
+        gl = find_line_fuzzy(lines, ["grand total"], cutoff=0.60)
+        vl = find_line_fuzzy(lines, ["vat"], cutoff=0.55)
+        sl = find_line_fuzzy(lines, ["subtotal"], exclude=["grand","vat"], cutoff=0.55)
+        grand = rightmost_number_on_line(df_words, gl) if gl is not None else None
+        vat   = rightmost_number_on_line(df_words, vl) if vl is not None else None
+        sub   = rightmost_number_on_line(df_words, sl) if sl is not None else None
+        return sub, vat, grand
 
-    grand = rightmost_number_on_line(df_words, gl) if gl is not None else None
-    vat   = rightmost_number_on_line(df_words, vl) if vl is not None else None
-    sub   = rightmost_number_on_line(df_words, sl) if sl is not None else None
+    for (x1,y1,x2,y2) in ZONES:
+        zone = ln.copy()
+        zone = zone[(zone["left"]  >= page_w*x1) & (zone["right"] <= page_w*x2)]
+        if page_h is not None:
+            zone = zone[(zone["top"]   >= page_h*y1) & (zone["bottom"]<= page_h*y2)]
+        sub, vat, grand = amounts_in_lines(zone)
+        candidates.append((sub,vat,grand))
 
-    # Fallback: 3–4 บรรทัดสุดท้ายของฝั่งขวาล่าง
-    if grand is None or sub is None:
-        money_rows=[]
-        for _,r in right_lines.iterrows():
-            v = rightmost_number_on_line(df_words, r)
-            if v is not None: money_rows.append((r["top"], v))
-        money_rows = sorted(money_rows, key=lambda x:x[0])
-        tail = [v for _,v in money_rows[-4:]]
-        if tail:
-            tail = sorted(tail)
-            if grand is None: grand = tail[-1]
-            if sub is None and len(tail)>=2: sub = tail[-2]
-            if vat is None and grand is not None and sub is not None: vat = round(grand - sub, 2)
+    # Fallback: ทั้งหน้าฝั่งขวา
+    zone_all = ln[ln["right"] > page_w*0.50]
+    candidates.append(amounts_in_lines(zone_all))
 
-    # Heuristic 7%
+    # Tail numbers: เก็บค่าตัวเงินท้ายหน้า
+    money_rows=[]
+    for _,r in ln.iterrows():
+        v = rightmost_number_on_line(df_words, r)
+        if v is not None: money_rows.append((r["top"], v))
+    money_rows = sorted(money_rows, key=lambda x:x[0])[-6:]
+    tail = [v for _,v in money_rows]
+    if len(tail)>=2:
+        t_sorted = sorted(tail)
+        candidates.append((t_sorted[-2], None, t_sorted[-1]))  # (sub?, ?, grand)
+
+    # เลือกชุดที่สมการเงินดีที่สุด
+    best = (None,None,None); best_err = 1e18
+    for (s,v,g) in candidates:
+        if s is None and v is not None and g is not None: s = round(g - v, 2)
+        if v is None and s is not None and g is not None: v = round(g - s, 2)
+        if g is None and s is not None and v is not None: g = round(s + v, 2)
+        if s is None and v is None and g is None: continue
+        if (s is not None) and (v is not None) and (g is not None):
+            err = abs((s+v) - g)
+        elif g is not None and (s is not None or v is not None):
+            err = 0.09
+        else:
+            err = 0.5
+        if err < best_err:
+            best_err, best = err, (s,v,g)
+
+    sub, vat, grand = best
+    # ถ้ามีคำว่า 7% ให้ reconcile อีกครั้ง
     all_text = " ".join(ln["text"].tolist())
     if re.search(r"vat\s*7\s*%|ภาษี\s*7\s*%", all_text, flags=re.I):
         if grand and sub and (vat is None or vat < 50): vat = round(grand - sub, 2)
-
-    # Reconcile
-    if grand is None and sub is not None and vat is not None: grand = round(sub + vat, 2)
-    if sub is None and grand is not None and vat is not None: sub = round(grand - vat, 2)
-    if vat is None and grand is not None and sub is not None: vat = round(grand - sub, 2)
     return sub, vat, grand
 
 # ---------------- PDF helper ----------------
@@ -377,7 +420,7 @@ with st.sidebar:
 TESS_OK, TESS_PATH, TESS_MSG = ensure_tesseract(user_tess_path.strip() or None)
 st.sidebar.write("**Tesseract:** ", "✅ "+str(TESS_PATH) if TESS_OK else "❌ "+str(TESS_MSG))
 
-st.title("🧾 OCR ใบเสนอราคา/บิล ➜ สรุปเป็นตาราง (fuzzy + near-anchor date)")
+st.title("🧾 OCR ใบเสนอราคา/บิล ➜ สรุปเป็นตาราง (fuzzy + multi-zone totals)")
 uploads = st.file_uploader("อัปโหลด JPG/PNG/PDF ได้หลายไฟล์", type=["jpg","jpeg","png","pdf"], accept_multiple_files=True)
 
 records=[]
@@ -420,6 +463,10 @@ if uploads:
                                              use_column_width=True)
                             except Exception as e:
                                 st.write(f"⚠️ แสดงรูป {name} ไม่ได้: {e}")
+
+            if not TESS_OK:
+                st.error("ไม่พบ Tesseract ในระบบ กรุณาติดตั้ง/ระบุ path ในแถบด้านซ้าย")
+                continue
 
             df_words = ocr_data(steps["upscale(1.8x)"])
             page_h, page_w = steps["original"].shape[:2]
