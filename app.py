@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 import cv2, fitz, dateparser
-from difflib import SequenceMatcher  # ใช้ fuzzy โดยไม่ต้องติดตั้ง lib เพิ่ม
+from difflib import SequenceMatcher  # fuzzy แบบไม่ต้องติดตั้งเพิ่ม
 
 # ---------------- OCR: Tesseract ----------------
 try:
@@ -150,16 +150,14 @@ def lines_from_df(df: pd.DataFrame) -> pd.DataFrame:
     ln["right"] = ln["right"] + df.groupby(g)["width"].max().values
     return ln
 
-# ===== NEW: fuzzy helper & keyword expansion =====
+# ===== fuzzy/helpers =====
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9ก-๙]+","", (s or "").lower())
 
 def _ratio(a: str, b: str) -> float:
-    # token-set ratio แบบง่าย + SequenceMatcher
     a, b = _norm(a), _norm(b)
     if not a or not b: return 0.0
     sm = SequenceMatcher(None, a, b).ratio()
-    # partial (สั้นเทียบยาว)
     if len(a) < len(b):
         best = 0
         for i in range(0, len(b)-len(a)+1):
@@ -200,53 +198,32 @@ def find_line_fuzzy(ln: pd.DataFrame, include: List[str], exclude: List[str]=Non
     cand = cand.sort_values(["page_num","top","left","__score__"])
     return cand.iloc[-1] if prefer_last else cand.iloc[-1]
 
-# ------------------------------------------------
-def find_line(ln: pd.DataFrame, include: List[str], exclude: List[str]=None, prefer_last=False) -> Optional[pd.Series]:
-    # คงเวอร์ชันเดิมไว้ (ใช้งานบางจุด) แต่ส่วนหลักจะเรียก find_line_fuzzy แทน
-    if exclude is None: exclude=[]
-    inc=[re.sub(r"[^a-z0-9ก-๙]+","",k.lower()) for k in include]
-    exc=[re.sub(r"[^a-z0-9ก-๙]+","",k.lower()) for k in exclude]
-    def ok(s):
-        s = re.sub(r"[^a-z0-9ก-๙]+","", s.lower())
-        return any(k in s for k in inc) and not any(x in s for x in exc)
-    cand = ln[ln["text"].apply(ok)]
-    if cand.empty: return None
-    cand = cand.sort_values(["page_num","top","left"])
-    return cand.iloc[-1] if prefer_last else cand.iloc[0]
+# --------- tokens/values near anchor (ใหม่: ไม่บังคับอยู่บรรทัดเดียว) ----------
+def tokens_right_of_anchor(df_words: pd.DataFrame, anchor_row: pd.Series,
+                           max_dx: int = 900, dy_factor: float = 1.4) -> List[str]:
+    """เลือก token ที่อยู่ทางขวาของฉลาก (ภายในกรอบกว้าง max_dx และสูง dy_factor*height)"""
+    h = int(anchor_row["height"])
+    top_min = int(anchor_row["top"] - max(12, h*0.4))
+    top_max = int(anchor_row["top"] + h*dy_factor)
+    mask = (df_words["page_num"]==anchor_row["page_num"]) & \
+           (df_words["left"] > anchor_row["right"]+2) & \
+           (df_words["left"] < anchor_row["right"]+max_dx) & \
+           (df_words["top"] >= top_min) & (df_words["top"] <= top_max)
+    return df_words[mask].sort_values(["top","left"])["text"].tolist()
 
-def right_tokens(df_words: pd.DataFrame, line_row: pd.Series, cutoff: Optional[int]=None) -> List[str]:
-    if cutoff is None:
-        cutoff = line_row["left"] + (line_row["right"]-line_row["left"])//2
-    mask = (df_words["page_num"]==line_row["page_num"]) & \
-           (df_words["block_num"]==line_row["block_num"]) & \
-           (df_words["par_num"]==line_row["par_num"]) & \
-           (df_words["line_num"]==line_row["line_num"]) & \
-           (df_words["left"]>cutoff+5)
-    return df_words[mask].sort_values("left")["text"].tolist()
-
-def rightmost_number_on_line(df_words: pd.DataFrame, line_row: pd.Series) -> Optional[float]:
-    mask = (df_words["page_num"]==line_row["page_num"]) & \
-           (df_words["block_num"]==line_row["block_num"]) & \
-           (df_words["par_num"]==line_row["par_num"]) & \
-           (df_words["line_num"]==line_row["line_num"])
-    sub = df_words[mask].sort_values("left")
-    nums=[]
-    for _,r in sub.iterrows():
-        if re.fullmatch(r"\d[\d,]*\.?\d*", r["text"]):
-            nums.append((r["left"], normalize_number(r["text"])))
-    if nums: return nums[-1][1]
-    return None
-
-# ---------------- Vendor cleaner (แก้ชื่อบริษัทให้จบที่ Ltd./จำกัด) ----------------
+# ---------------- Vendor cleaner (ตัด “ตัวนำหนึ่งตัวอักษร” ออก) ----------------
 def _clean_vendor_line(s: str) -> str:
     s = " ".join(s.split())
-    m = re.search(r"([A-Za-z][A-Za-z '&\.\-]+?(?:Co\.,?\s*Ltd\.|Company\s*Limited))", s, flags=re.I)
+    # จับอังกฤษให้จบ Co., Ltd. / Company Limited และไม่ยอมให้มีอักษรเดี่ยวคั่นหน้า
+    m = re.search(r"(?<![A-Za-z]\s)([A-Za-z][A-Za-z '&\.\-]+?(?:Co\.,?\s*Ltd\.|Company\s*Limited))", s, flags=re.I)
     if m:
-        v = m.group(1)
+        v = m.group(1).strip()
+        v = re.sub(r"^[A-Za-z]\s+(?=[A-Za-z])", "", v)  # ตัด "M " ที่มาจากโลโก้
         v = re.sub(r"\s*,\s*", ", ", v)
         v = re.sub(r"\s+Co\.,?\s*Ltd\.?", " Co., Ltd.", v, flags=re.I)
         v = re.sub(r"\s+Company\s+Limited", " Company Limited", v, flags=re.I)
         return v.strip()
+    # ภาษาไทย
     m = re.search(r"(บริษัท.+?(?:จำกัด\(มหาชน\)|จำกัด))", s)
     if m:
         return m.group(1).strip()
@@ -261,12 +238,15 @@ def extract_vendor(df_words: pd.DataFrame, page_h: int) -> Optional[str]:
     head = head[~head["text"].str.contains(BAD_VENDOR, flags=re.I, regex=True, na=False)]
     head_text = " ".join(head.sort_values(["top","left"])["text"].tolist())
     head_text = " ".join(head_text.split())
-    m = re.search(r"([A-Za-z][A-Za-z '&\.\-]+?(?:Co\.,?\s*Ltd\.|Company\s*Limited))", head_text, flags=re.I)
+    # อังกฤษก่อน
+    m = re.search(r"(?<![A-Za-z]\s)([A-Za-z][A-Za-z '&\.\-]+?(?:Co\.,?\s*Ltd\.|Company\s*Limited))", head_text, flags=re.I)
     if m:
         return _clean_vendor_line(m.group(1))
+    # ไทยรอง
     m = re.search(r"(บริษัท.+?(?:จำกัด\(มหาชน\)|จำกัด))", head_text)
     if m:
         return _clean_vendor_line(m.group(1))
+    # สำรอง: เลือกบรรทัดที่ดูเหมือนชื่อบริษัท
     if not head.empty:
         pri = pd.Series(0, index=head.index, dtype=float)
         pri += head["text"].str.contains(r"บริษัท|จำกัด", regex=True).astype(int)*2
@@ -276,34 +256,49 @@ def extract_vendor(df_words: pd.DataFrame, page_h: int) -> Optional[str]:
         return _clean_vendor_line(winner)
     return None
 
-# ---------------- Header fields & Amounts (อัปเกรดเป็น fuzzy) ----------------
+# ---------------- Header fields & Amounts ----------------
 def extract_header(df_words: pd.DataFrame)->Tuple[Optional[str], Optional[str]]:
     ln = lines_from_df(df_words)
-    ql = find_line_fuzzy(ln, ["quotation no","quotation"], cutoff=0.70)
+    # Quotation No
+    ql = find_line_fuzzy(ln, ["quotation no","quotation"], cutoff=0.68)
     qt, dt = None, None
     if ql is not None:
-        tx = " ".join(right_tokens(df_words, ql))
-        # ก่อนใช้ regex ลองแพทเทิร์นเฉพาะ (เช่น KS########)
+        tx = " ".join(tokens_right_of_anchor(df_words, ql))
         m = re.search(r"\b[A-Z]{1,3}\d{6,}\b", tx)
         if m: qt = m.group(0)
         if qt is None:
             qs = re.findall(r"[A-Za-z][A-Za-z0-9/_\-.]{5,}", tx)
             if qs: qt = max(qs, key=len).upper()
-        dt = parse_date_candidates(tx)
+    # Date (ใช้กรอบใกล้ขวาของคำว่า Date โดยตรง)
+    dl = find_line_fuzzy(ln, ["date","วันที่"], cutoff=0.60)
+    if dl is not None:
+        tokens = tokens_right_of_anchor(df_words, dl)
+        dt = parse_date_candidates(" ".join(tokens))
     if dt is None:
-        dl = find_line_fuzzy(ln, ["date","วันที่"], cutoff=0.66)
-        if dl is not None:
-            dt = parse_date_candidates(" ".join(right_tokens(df_words, dl)))
+        # สำรอง: หาในทั้งหน้า
+        alltxt = " ".join(ln["text"].tolist())
+        dt = parse_date_candidates(alltxt)
     if qt is None:
         alltxt = " ".join(ln["text"].tolist())
         m = re.search(r"\b[A-Z]{1,3}\d{6,}\b", alltxt)
         if m: qt = m.group(0)
     return qt, dt
 
+def rightmost_number_on_line(df_words: pd.DataFrame, line_row: pd.Series) -> Optional[float]:
+    mask = (df_words["page_num"]==line_row["page_num"]) & \
+           (df_words["block_num"]==line_row["block_num"]) & \
+           (df_words["par_num"]==line_row["par_num"]) & \
+           (df_words["line_num"]==line_row["line_num"])
+    sub = df_words[mask].sort_values("left")
+    nums=[]
+    for _,r in sub.iterrows():
+        if re.fullmatch(r"\d[\d,]*\.?\d*", r["text"]):
+            nums.append((r["left"], normalize_number(r["text"])))
+    if nums: return nums[-1][1]
+    return None
+
 def extract_amounts(df_words: pd.DataFrame, page_w:int, page_h:int=None)->Tuple[Optional[float], Optional[float], Optional[float]]:
     ln = lines_from_df(df_words)
-
-    # focus เฉพาะครึ่งขวา + โซนล่าง (กล่องสรุปยอดมักอยู่ล่างขวา)
     right_lines = ln[(ln["right"] > page_w*0.55)]
     if page_h is not None:
         right_lines = right_lines[(right_lines["top"] > page_h*0.60)]
@@ -316,21 +311,21 @@ def extract_amounts(df_words: pd.DataFrame, page_w:int, page_h:int=None)->Tuple[
     vat   = rightmost_number_on_line(df_words, vl) if vl is not None else None
     sub   = rightmost_number_on_line(df_words, sl) if sl is not None else None
 
-    # Fallback: 3 บรรทัดสุดท้ายของโซนขวาล่าง
+    # Fallback: 3–4 บรรทัดสุดท้ายของฝั่งขวาล่าง
     if grand is None or sub is None:
         money_rows=[]
         for _,r in right_lines.iterrows():
             v = rightmost_number_on_line(df_words, r)
             if v is not None: money_rows.append((r["top"], v))
         money_rows = sorted(money_rows, key=lambda x:x[0])
-        tail = [v for _,v in money_rows[-4:]]  # เผื่อขึ้นบรรทัดว่าง
+        tail = [v for _,v in money_rows[-4:]]
         if tail:
             tail = sorted(tail)
             if grand is None: grand = tail[-1]
             if sub is None and len(tail)>=2: sub = tail[-2]
             if vat is None and grand is not None and sub is not None: vat = round(grand - sub, 2)
 
-    # Heuristic 7% (ถ้ามีคำว่า VAT 7%)
+    # Heuristic 7%
     all_text = " ".join(ln["text"].tolist())
     if re.search(r"vat\s*7\s*%|ภาษี\s*7\s*%", all_text, flags=re.I):
         if grand and sub and (vat is None or vat < 50): vat = round(grand - sub, 2)
@@ -382,7 +377,7 @@ with st.sidebar:
 TESS_OK, TESS_PATH, TESS_MSG = ensure_tesseract(user_tess_path.strip() or None)
 st.sidebar.write("**Tesseract:** ", "✅ "+str(TESS_PATH) if TESS_OK else "❌ "+str(TESS_MSG))
 
-st.title("🧾 OCR ใบเสนอราคา/บิล ➜ สรุปเป็นตาราง (fuzzy + right-bottom zone)")
+st.title("🧾 OCR ใบเสนอราคา/บิล ➜ สรุปเป็นตาราง (fuzzy + near-anchor date)")
 uploads = st.file_uploader("อัปโหลด JPG/PNG/PDF ได้หลายไฟล์", type=["jpg","jpeg","png","pdf"], accept_multiple_files=True)
 
 records=[]
