@@ -420,7 +420,7 @@ with st.sidebar:
 TESS_OK, TESS_PATH, TESS_MSG = ensure_tesseract(user_tess_path.strip() or None)
 st.sidebar.write("**Tesseract:** ", "✅ "+str(TESS_PATH) if TESS_OK else "❌ "+str(TESS_MSG))
 
-st.title("🧾 OCR ใบเสนอราคา/บิล ➜ สรุปเป็นตาราง (fuzzy + multi-zone totals)")
+st.title("🧾 OCR ใบเสนอราคา/บิล ➜ สรุปเป็นตาราง")
 uploads = st.file_uploader("อัปโหลด JPG/PNG/PDF ได้หลายไฟล์", type=["jpg","jpeg","png","pdf"], accept_multiple_files=True)
 
 records=[]
